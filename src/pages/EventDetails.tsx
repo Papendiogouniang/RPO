@@ -79,31 +79,8 @@ const EventDetails: React.FC = () => {
 
       const paymentData = response.data.data;
 
-      // Call Intouch payment function (script already loaded in index.html)
-      const intouchWindow = window as typeof window & {
-        sendPaymentInfos?: (...args: unknown[]) => void;
-      };
-      
-      if (typeof intouchWindow.sendPaymentInfos === 'function') {
-        intouchWindow.sendPaymentInfos(
-          paymentData.reference,
-          paymentData.clientId,
-          paymentData.clientSecret,
-          paymentData.companyName,
-          paymentData.currency,
-          paymentData.customerName,
-          paymentData.amount,
-          'Dakar',
-          event!.address,
-          paymentData.customerPhone,
-          paymentData.customerEmail,
-          paymentData.returnUrl,
-          paymentData.cancelUrl
-        );
-      } else {
-        toast.error('Système de paiement non disponible');
-        setPurchasing(false);
-      }
+      // Redirect to payment status page
+      navigate(`/payment/status/${paymentData.ticketId}`);
 
     } catch (error: unknown) {
       console.error('Payment initialization error:', error);

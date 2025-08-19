@@ -18,6 +18,7 @@ import Register from './pages/Register';
 import Profile from './pages/Profile';
 import MyTickets from './pages/MyTickets';
 import PaymentCallback from './pages/PaymentCallback';
+import PaymentStatus from './pages/PaymentStatus';
 
 // Admin Pages
 import AdminDashboard from './pages/admin/AdminDashboard';
@@ -68,6 +69,7 @@ const AppContent: React.FC = () => {
           <Route path="/login" element={user ? <Navigate to="/" /> : <Login />} />
           <Route path="/register" element={user ? <Navigate to="/" /> : <Register />} />
           <Route path="/payment/callback" element={<PaymentCallback />} />
+          <Route path="/payment/status/:ticketId" element={<PaymentStatus />} />
 
           {/* Protected User Routes */}
           <Route 

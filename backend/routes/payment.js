@@ -1,8 +1,10 @@
 import express from 'express';
+import axios from 'axios';
 import Ticket from '../models/Ticket.js';
 import Event from '../models/Event.js';
 import User from '../models/User.js';
 import { protect } from '../middleware/auth.js';
+import { sendTicketEmail } from '../services/emailService.js';
 
 const router = express.Router();
 
@@ -12,7 +14,14 @@ router.post('/intouch/init', protect, async (req, res) => {
     const { eventId, quantity = 1 } = req.body;
 
     // Validate required environment variables
-    const requiredEnvVars = ['INTOUCH_CLIENT_ID', 'INTOUCH_CLIENT_SECRET', 'INTOUCH_COMPANY_NAME', 'FRONTEND_URL'];
+    const requiredEnvVars = [
+      'INTOUCH_AGENCY_CODE',
+      'INTOUCH_PARTNER_ID', 
+      'INTOUCH_LOGIN_API',
+      'INTOUCH_PASSWORD_API',
+      'FRONTEND_URL'
+    ];
+    
     const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
     
     if (missingEnvVars.length > 0) {
@@ -20,7 +29,7 @@ router.post('/intouch/init', protect, async (req, res) => {
       return res.status(500).json({
         success: false,
         message: 'Configuration de paiement incomplète',
-        error: 'Variables d\'environnement manquantes'
+        error: 'Variables d\'environnement manquantes: ' + missingEnvVars.join(', ')
       });
     }
 
@@ -75,28 +84,73 @@ router.post('/intouch/init', protect, async (req, res) => {
       paymentStatus: 'pending'
     });
 
-    // Generate unique reference
-    const reference = `KZ-${ticket.ticketNumber}-${Date.now()}`;
+    // Generate unique partner transaction ID
+    const partnerTransactionId = `KZ-${ticket.ticketNumber}-${Date.now()}`;
 
-    res.json({
-      success: true,
-      message: 'Paiement initialisé avec succès',
-      data: {
-        reference,
-        amount: totalAmount,
-        ticketId: ticket._id,
-        clientId: process.env.INTOUCH_CLIENT_ID,
-        clientSecret: process.env.INTOUCH_CLIENT_SECRET,
-        companyName: process.env.INTOUCH_COMPANY_NAME,
-        currency: 'XOF',
-        customerName: `${user.firstName} ${user.lastName}`,
-        customerEmail: user.email,
-        customerPhone: user.phone,
-        description: `Billet(s) pour ${event.title}`,
-        returnUrl: `${process.env.FRONTEND_URL}/payment/callback?ticketId=${ticket._id}&reference=${reference}`,
-        cancelUrl: `${process.env.FRONTEND_URL}/events/${eventId}`
-      }
+    // Prepare InTouch payment request
+    const intouchPayload = {
+      service_id: "SN_Payment_OrangeMoney", // Default to Orange Money, can be made configurable
+      recipient_phone_number: user.phone.replace(/\D/g, ''), // Remove non-digits
+      amount: totalAmount,
+      partner_id: process.env.INTOUCH_PARTNER_ID,
+      partner_transaction_id: partnerTransactionId,
+      login_api: process.env.INTOUCH_LOGIN_API,
+      password_api: process.env.INTOUCH_PASSWORD_API,
+      call_back_url: `${process.env.FRONTEND_URL.replace('5173', '5000')}/api/payment/intouch/callback`
+    };
+
+    console.log('InTouch payment request:', {
+      ...intouchPayload,
+      password_api: '***hidden***'
     });
+
+    // Make request to InTouch API
+    const intouchUrl = `https://apidist.gutouch.net/apidist/sec/${process.env.INTOUCH_AGENCY_CODE}/cashin`;
+    
+    try {
+      const intouchResponse = await axios.post(intouchUrl, intouchPayload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        timeout: 30000 // 30 seconds timeout
+      });
+
+      console.log('InTouch response:', intouchResponse.data);
+
+      // Update ticket with InTouch transaction reference
+      ticket.paymentReference = partnerTransactionId;
+      await ticket.save();
+
+      // Return success response with payment details
+      res.json({
+        success: true,
+        message: 'Paiement initialisé avec succès',
+        data: {
+          ticketId: ticket._id,
+          ticketNumber: ticket.ticketNumber,
+          partnerTransactionId,
+          amount: totalAmount,
+          customerPhone: user.phone,
+          intouchResponse: intouchResponse.data,
+          instructions: 'Veuillez suivre les instructions sur votre téléphone pour compléter le paiement.'
+        }
+      });
+
+    } catch (intouchError) {
+      console.error('InTouch API error:', intouchError.response?.data || intouchError.message);
+      
+      // Update ticket status to failed
+      ticket.paymentStatus = 'failed';
+      await ticket.save();
+
+      return res.status(500).json({
+        success: false,
+        message: 'Erreur lors de l\'initialisation du paiement mobile',
+        error: intouchError.response?.data?.message || intouchError.message
+      });
+    }
+
   } catch (error) {
     console.error('Init payment error:', error);
     res.status(500).json({
@@ -107,86 +161,128 @@ router.post('/intouch/init', protect, async (req, res) => {
   }
 });
 
-// Handle payment callback
+// Handle payment callback from InTouch
 router.post('/intouch/callback', async (req, res) => {
   try {
-    const { reference, status, transactionId, ticketId } = req.body;
+    console.log('InTouch callback received:', req.body);
 
-    console.log('Payment callback received:', req.body);
+    const { 
+      partner_transaction_id,
+      transaction_id,
+      status,
+      amount,
+      recipient_phone_number,
+      service_id,
+      message
+    } = req.body;
 
-    if (!ticketId) {
+    if (!partner_transaction_id) {
+      console.error('Missing partner_transaction_id in callback');
       return res.status(400).json({
         success: false,
-        message: 'ID de billet manquant'
+        message: 'ID de transaction partenaire manquant'
       });
     }
 
-    const ticket = await Ticket.findById(ticketId)
-      .populate([
-        { path: 'event', select: 'title date time location address image availableTickets' },
-        { path: 'user', select: 'firstName lastName email phone' }
-      ]);
+    // Find ticket by partner transaction ID
+    const ticket = await Ticket.findOne({ 
+      paymentReference: partner_transaction_id 
+    }).populate([
+      { path: 'event', select: 'title date time location address image availableTickets' },
+      { path: 'user', select: 'firstName lastName email phone' }
+    ]);
 
     if (!ticket) {
+      console.error('Ticket not found for transaction:', partner_transaction_id);
       return res.status(404).json({
         success: false,
-        message: 'Billet non trouvé'
+        message: 'Billet non trouvé pour cette transaction'
       });
     }
 
     // Update ticket based on payment status
-    if (status === 'success' || status === 'completed') {
+    if (status === 'SUCCESS' || status === 'COMPLETED') {
       ticket.paymentStatus = 'completed';
-      ticket.paymentReference = transactionId || reference;
+      ticket.paymentReference = transaction_id || partner_transaction_id;
       
       // Generate QR code
-      const QRCode = await import('qrcode');
-      const qrData = {
-        ticketId: ticket._id,
-        ticketNumber: ticket.ticketNumber,
-        eventId: ticket.event._id,
-        userId: ticket.user._id
-      };
-
-      ticket.qrCode = await QRCode.toDataURL(JSON.stringify(qrData));
-      await ticket.save();
-
-      // Update event available tickets
-      const event = await Event.findById(ticket.event._id);
-      if (event) {
-        event.availableTickets = Math.max(0, event.availableTickets - ticket.quantity);
-        await event.save();
-      }
-
-      // Send ticket email
       try {
-        const { sendTicketEmail } = await import('../services/emailService.js');
-        await sendTicketEmail(ticket);
-      } catch (emailError) {
-        console.error('Email send error:', emailError);
+        const QRCode = await import('qrcode');
+        const qrData = {
+          ticketId: ticket._id,
+          ticketNumber: ticket.ticketNumber,
+          eventId: ticket.event._id,
+          userId: ticket.user._id
+        };
+
+        ticket.qrCode = await QRCode.toDataURL(JSON.stringify(qrData));
+        await ticket.save();
+
+        // Update event available tickets
+        const event = await Event.findById(ticket.event._id);
+        if (event) {
+          event.availableTickets = Math.max(0, event.availableTickets - ticket.quantity);
+          await event.save();
+        }
+
+        // Send ticket email
+        try {
+          await sendTicketEmail(ticket);
+          console.log('Ticket email sent successfully');
+        } catch (emailError) {
+          console.error('Email send error:', emailError);
+        }
+
+        res.json({
+          success: true,
+          message: 'Paiement confirmé avec succès',
+          data: {
+            ticketId: ticket._id,
+            ticketNumber: ticket.ticketNumber,
+            status: 'completed'
+          }
+        });
+
+      } catch (qrError) {
+        console.error('QR code generation error:', qrError);
+        // Still mark as completed even if QR fails
+        await ticket.save();
+        
+        res.json({
+          success: true,
+          message: 'Paiement confirmé (QR code sera généré ultérieurement)',
+          data: {
+            ticketId: ticket._id,
+            ticketNumber: ticket.ticketNumber,
+            status: 'completed'
+          }
+        });
       }
+
+    } else {
+      // Payment failed
+      ticket.paymentStatus = 'failed';
+      ticket.notes = message || 'Paiement échoué';
+      await ticket.save();
 
       res.json({
-        success: true,
-        message: 'Paiement confirmé avec succès',
-        data: ticket
-      });
-    } else {
-      ticket.paymentStatus = 'failed';
-      ticket.paymentReference = transactionId || reference;
-      await ticket.save();
-
-      res.status(400).json({
         success: false,
-        message: 'Échec du paiement',
-        data: ticket
+        message: 'Paiement échoué',
+        data: {
+          ticketId: ticket._id,
+          ticketNumber: ticket.ticketNumber,
+          status: 'failed',
+          reason: message
+        }
       });
     }
+
   } catch (error) {
     console.error('Payment callback error:', error);
     res.status(500).json({
       success: false,
-      message: 'Erreur lors du traitement du callback de paiement'
+      message: 'Erreur lors du traitement du callback de paiement',
+      error: error.message
     });
   }
 });
@@ -226,6 +322,43 @@ router.get('/status/:ticketId', protect, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Erreur lors de la récupération du statut de paiement'
+    });
+  }
+});
+
+// Check transaction status manually (for debugging)
+router.get('/check/:partnerTransactionId', protect, async (req, res) => {
+  try {
+    const { partnerTransactionId } = req.params;
+    
+    const ticket = await Ticket.findOne({ 
+      paymentReference: partnerTransactionId 
+    }).populate([
+      { path: 'event', select: 'title date time location' },
+      { path: 'user', select: 'firstName lastName email' }
+    ]);
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        message: 'Transaction non trouvée'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ticket,
+        status: ticket.paymentStatus,
+        reference: ticket.paymentReference
+      }
+    });
+
+  } catch (error) {
+    console.error('Check transaction error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erreur lors de la vérification de la transaction'
     });
   }
 });
